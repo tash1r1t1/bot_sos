@@ -6,9 +6,11 @@ from datetime import datetime, timedelta, timezone
 from math import asin, cos, radians, sin, sqrt
 
 from telegram import (
+    Bot,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
+    LabeledPrice,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
     Update,
@@ -19,18 +21,26 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    PreCheckoutQueryHandler,
     filters,
 )
 
 
 DB_PATH = os.getenv("BOT_DB_PATH", "bot.db")
 TOKEN = os.getenv("BOT_TOKEN")
+MONITOR_BOT_TOKEN = os.getenv("MONITOR_BOT_TOKEN")
+MONITOR_CHAT_ID = os.getenv("MONITOR_CHAT_ID")
+PROVIDER_TOKEN = os.getenv("PROVIDER_TOKEN")
+PAYMENT_CURRENCY = os.getenv("PAYMENT_CURRENCY", "UAH")
+SOS_FEE = int(os.getenv("SOS_FEE", "200"))
 DEFAULT_RADIUS_KM = 3
 EXPANDED_RADIUS_KM = 10
 WALKING_SPEED_KMH = 5
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+monitor_bot = Bot(MONITOR_BOT_TOKEN) if MONITOR_BOT_TOKEN else None
 
 
 @dataclass
@@ -80,6 +90,17 @@ def init_db() -> None:
                 arrived_at TEXT,
                 feedback TEXT,
                 media_file_id TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS payments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                case_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                currency TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                provider_payment_charge_id TEXT
             );
             """
         )
@@ -204,6 +225,30 @@ def accept_case(case_id: int, helper_id: int) -> None:
         )
 
 
+def create_payment(case_id: int, user_id: int, amount: int, currency: str) -> int:
+    with sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO payments (case_id, user_id, amount, currency, status, created_at)
+            VALUES (?, ?, ?, ?, 'pending', ?)
+            """,
+            (case_id, user_id, amount, currency, now_utc().isoformat()),
+        )
+        return cursor.lastrowid
+
+
+def mark_payment_paid(payment_id: int, provider_charge_id: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            """
+            UPDATE payments
+            SET status='paid', provider_payment_charge_id=?
+            WHERE id=?
+            """,
+            (provider_charge_id, payment_id),
+        )
+
+
 def haversine_km(a: Location, b: Location) -> float:
     r = 6371
     dlat = radians(b.lat - a.lat)
@@ -230,6 +275,15 @@ def main_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
     )
+
+
+async def notify_monitor(message: str) -> None:
+    if not monitor_bot or not MONITOR_CHAT_ID:
+        return
+    try:
+        await monitor_bot.send_message(chat_id=MONITOR_CHAT_ID, text=message)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Monitor notify failed: %s", exc)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -311,6 +365,7 @@ async def finish_sos(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("У вас немає активних SOS.", reply_markup=main_keyboard())
         return
     close_sos_case(case_id)
+    await notify_monitor(f"SOS #{case_id} завершено користувачем {user.id}.")
     await update.message.reply_text(
         f"SOS #{case_id} завершено. Дякуємо!\n"
         "Будь ласка, опишіть результат та, за можливості, надішліть аудіо/відео.",
@@ -401,6 +456,9 @@ async def on_ready_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await query.edit_message_text(
         f"READY увімкнено до {ready_until.isoformat(timespec='minutes')}."
     )
+    await notify_monitor(
+        f"Helper {query.from_user.id} READY до {ready_until.isoformat(timespec='minutes')}."
+    )
 
 
 async def handle_sos_creation(
@@ -411,6 +469,7 @@ async def handle_sos_creation(
 ) -> None:
     user = update.effective_user
     case_id = create_sos_case(user.id, location, text)
+    await notify_monitor(f"Створено SOS #{case_id} від користувача {user.id}.")
     helpers = get_ready_helpers(location, DEFAULT_RADIUS_KM)
     radius = DEFAULT_RADIUS_KM
     if not helpers:
@@ -435,6 +494,18 @@ async def handle_sos_creation(
         "Якщо є загроза життю — телефонуйте 102/103/112.",
         reply_markup=main_keyboard(),
     )
+    if PROVIDER_TOKEN:
+        payment_id = create_payment(case_id, user.id, SOS_FEE, PAYMENT_CURRENCY)
+        prices = [LabeledPrice(label="SOS депозит", amount=SOS_FEE * 100)]
+        await context.bot.send_invoice(
+            chat_id=user.id,
+            title=f"SOS #{case_id} депозит",
+            description="Оплата для компенсації хелперам після підтвердження.",
+            payload=f"sos:{case_id}:{payment_id}",
+            provider_token=PROVIDER_TOKEN,
+            currency=PAYMENT_CURRENCY,
+            prices=prices,
+        )
     context.user_data.pop("flow", None)
 
 
@@ -444,6 +515,25 @@ async def on_accept(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     case_id = int(query.data.split("_")[1])
     accept_case(case_id, query.from_user.id)
     await query.edit_message_text(f"Ви прийняли SOS #{case_id}. Будьте обережні.")
+    await notify_monitor(f"Helper {query.from_user.id} прийняв SOS #{case_id}.")
+
+
+async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+
+async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    payment = update.message.successful_payment
+    payload_parts = payment.invoice_payload.split(":")
+    if len(payload_parts) != 3:
+        return
+    payment_id = int(payload_parts[2])
+    mark_payment_paid(payment_id, payment.provider_payment_charge_id)
+    await update.message.reply_text("Оплату отримано. Дякуємо!", reply_markup=main_keyboard())
+    await notify_monitor(
+        f"Оплата підтверджена: payment_id={payment_id}, amount={payment.total_amount}."
+    )
 
 
 def build_app() -> Application:
@@ -463,6 +553,8 @@ def build_app() -> Application:
     application.add_handler(CallbackQueryHandler(on_accept, pattern=r"^accept_"))
     application.add_handler(MessageHandler(filters.LOCATION, on_location))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
+    application.add_handler(PreCheckoutQueryHandler(precheckout_handler))
+    application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
 
     return application
 
